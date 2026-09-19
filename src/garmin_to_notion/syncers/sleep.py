@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -16,47 +17,16 @@ from garmin_to_notion.notion_helpers import fetch_all_pages, get_prop
 logger = logging.getLogger(__name__)
 
 
-def _compute_sleep_score(
-    deep_sec: int, light_sec: int, rem_sec: int, awake_sec: int
-) -> int:
-    """Compute a 0-100 sleep quality score from sleep stage data.
-
-    Scoring (inspired by WHOOP/Oura methodology):
-    - Duration score (40%): optimal 7-9h total sleep
-    - Deep % score (25%): optimal ~20% of total sleep
-    - REM % score (25%): optimal ~22% of total sleep
-    - Awake penalty (10%): less awake time = better
-
-    Returns minimum 1 for valid data (avoids zero in charts).
-    """
-    total_sleep = deep_sec + light_sec + rem_sec
-    if total_sleep == 0:
-        return 0
-
-    total_hours = total_sleep / 3600
-
-    # Duration: 100 if 7-9h, linear ramp from 4h->7h and 9h->11h
-    if 7 <= total_hours <= 9:
-        dur_score = 100
-    elif total_hours < 7:
-        dur_score = max(0, (total_hours - 4) / 3 * 100)
-    else:
-        dur_score = max(0, (11 - total_hours) / 2 * 100)
-
-    # Deep %: optimal ~20%, score drops linearly away from target
-    deep_pct = deep_sec / total_sleep * 100
-    deep_score = max(0, 100 - abs(deep_pct - 20) * 4)
-
-    # REM %: optimal ~22%, score drops linearly away from target
-    rem_pct = rem_sec / total_sleep * 100
-    rem_score = max(0, 100 - abs(rem_pct - 22) * 4)
-
-    # Awake penalty: 0 min = 100, 30+ min = 0
-    awake_min = awake_sec / 60
-    awake_score = max(0, 100 - awake_min * (100 / 30))
-
-    score = dur_score * 0.40 + deep_score * 0.25 + rem_score * 0.25 + awake_score * 0.10
-    return round(min(100, max(1, score)))
+def _get_garmin_sleep_score(daily_sleep: dict) -> int | None:
+    """Read Garmin's overall score without calculating a replacement."""
+    scores = daily_sleep.get("sleepScores") or {}
+    overall = scores.get("overall") or {}
+    value = overall.get("value")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not 0 <= value <= 100 or int(value) != value:
+        return None
+    return int(value)
 
 
 def _get_existing_sleep_dates(
@@ -70,38 +40,6 @@ def _get_existing_sleep_dates(
         if date_str:
             result[date_str[:10]] = page
     return result
-
-
-def _get_sleep_range(
-    garmin: GarminClient,
-    days_back: int,
-    tz: ZoneInfo,
-    existing_dates: set[str],
-) -> list[dict]:
-    """Fetch sleep data for the last *days_back* days, skipping known dates."""
-    today = datetime.now(tz=tz).date()
-    results = []
-    skipped = 0
-    for i in range(days_back):
-        d = today - timedelta(days=i)
-        date_str = d.isoformat()
-        if date_str in existing_dates:
-            skipped += 1
-            continue
-        try:
-            data = garmin.get_sleep_data(date_str)
-            if data and data.get("dailySleepDTO"):
-                results.append(data)
-        except Exception:
-            logger.debug("No sleep data for %s", date_str)
-        if (i + 1) % 100 == 0:
-            logger.info(
-                "Sleep fetch progress: %d/%d days checked (%d skipped)",
-                i + 1, days_back, skipped,
-            )
-    if skipped:
-        logger.info("Skipped %d days already in Notion", skipped)
-    return results
 
 
 def _build_properties(sleep_data: dict, settings: Settings) -> dict | None:
@@ -120,12 +58,7 @@ def _build_properties(sleep_data: dict, settings: Settings) -> dict | None:
         logger.info("Skipping sleep data for %s (total sleep is 0)", sleep_date)
         return None
 
-    score = _compute_sleep_score(
-        daily_sleep.get("deepSleepSeconds", 0) or 0,
-        daily_sleep.get("lightSleepSeconds", 0) or 0,
-        daily_sleep.get("remSleepSeconds", 0) or 0,
-        daily_sleep.get("awakeSleepSeconds", 0) or 0,
-    )
+    score = _get_garmin_sleep_score(daily_sleep)
 
     return {
         "Name": {
@@ -140,7 +73,7 @@ def _build_properties(sleep_data: dict, settings: Settings) -> dict | None:
                 {
                     "text": {
                         "content": format_duration(
-                            daily_sleep.get("deepSleepSeconds", 0)
+                            daily_sleep.get("deepSleepSeconds", 0) or 0
                         )
                     }
                 }
@@ -151,7 +84,7 @@ def _build_properties(sleep_data: dict, settings: Settings) -> dict | None:
                 {
                     "text": {
                         "content": format_duration(
-                            daily_sleep.get("lightSleepSeconds", 0)
+                            daily_sleep.get("lightSleepSeconds", 0) or 0
                         )
                     }
                 }
@@ -162,7 +95,7 @@ def _build_properties(sleep_data: dict, settings: Settings) -> dict | None:
                 {
                     "text": {
                         "content": format_duration(
-                            daily_sleep.get("remSleepSeconds", 0)
+                            daily_sleep.get("remSleepSeconds", 0) or 0
                         )
                     }
                 }
@@ -173,7 +106,7 @@ def _build_properties(sleep_data: dict, settings: Settings) -> dict | None:
                 {
                     "text": {
                         "content": format_duration(
-                            daily_sleep.get("awakeSleepSeconds", 0)
+                            daily_sleep.get("awakeSleepSeconds", 0) or 0
                         )
                     }
                 }
@@ -189,68 +122,66 @@ def sync_sleep(
     notion: NotionClient,
     settings: Settings,
 ) -> None:
-    """Sync historical sleep data to the Notion Sleep database."""
+    """Import missing nights and refresh Garmin scores within days_back.
+
+    Existing dates are updated in place: no deletion or duplicate creation.
+    Keep a large days_back for the first historical correction, then reduce
+    it to 30 for the normal daily sync.
+    """
     if not settings.sleep_db_id:
         logger.info("No sleep database configured, skipping")
         return
 
-    # Bulk-fetch existing entries (1 Notion query instead of N)
-    logger.info("Fetching existing sleep entries from Notion...")
     existing_map = _get_existing_sleep_dates(notion, settings.sleep_db_id)
-    logger.info("Found %d existing sleep entries in Notion", len(existing_map))
+    today = datetime.now(tz=settings.timezone).date()
+    created = updated = unchanged = skipped = 0
 
-    # Fetch only missing days from Garmin
-    sleep_entries = _get_sleep_range(
-        garmin, settings.days_back, settings.timezone, set(existing_map.keys())
-    )
-    logger.info("Fetched %d new sleep entries from Garmin", len(sleep_entries))
-
-    created = 0
-
-    for data in sleep_entries:
-        sleep_date = data.get("dailySleepDTO", {}).get("calendarDate")
-        if not sleep_date:
-            continue
-
-        properties = _build_properties(data, settings)
-        if not properties:
-            continue
-
-        notion.pages.create(
-            parent={"database_id": settings.sleep_db_id},
-            properties=properties,
-        )
-        created += 1
-
-    # Repair entries with missing/zero scores
-    repaired = 0
-    for date_str, page in existing_map.items():
-        props = page["properties"]
-        current_score = get_prop(props, "Score", "number")
-        if current_score and current_score > 0:
-            continue
-
-        # Fetch fresh data from Garmin to recompute score
+    for i in range(settings.days_back):
+        date_str = (today - timedelta(days=i)).isoformat()
+        # Pace the historical import rather than sending requests in a burst.
+        if i:
+            time.sleep(0.5)
         try:
             data = garmin.get_sleep_data(date_str)
-            if not data or not data.get("dailySleepDTO"):
+        except Exception as exc:
+            # Do not erase a score when Garmin cannot be reached.
+            logger.error("Garmin sleep request failed for %s (%s); stopping",
+                         date_str, type(exc).__name__)
+            raise RuntimeError("Sleep sync interrupted; retry later") from None
+
+        daily_sleep = (data or {}).get("dailySleepDTO") or {}
+        if not daily_sleep or daily_sleep.get("calendarDate") != date_str:
+            skipped += 1
+            continue
+
+        page = existing_map.get(date_str)
+        if page:
+            score = _get_garmin_sleep_score(daily_sleep)
+            # An empty response must not erase an existing value.
+            total_sleep = sum((daily_sleep.get(k) or 0) for k in
+                              ("deepSleepSeconds", "lightSleepSeconds", "remSleepSeconds"))
+            if score is None and total_sleep <= 0:
+                skipped += 1
                 continue
-        except Exception:
-            continue
+            old_score = get_prop(page["properties"], "Score", "number")
+            if old_score != score:
+                notion.pages.update(page_id=page["id"],
+                                    properties={"Score": {"number": score}})
+                updated += 1
+            else:
+                unchanged += 1
+        else:
+            properties = _build_properties(data, settings)
+            if properties:
+                notion.pages.create(parent={"database_id": settings.sleep_db_id},
+                                    properties=properties)
+                created += 1
+            else:
+                skipped += 1
 
-        new_props = _build_properties(data, settings)
-        if not new_props:
-            continue
+        if (i + 1) % 100 == 0:
+            logger.info("Garmin sleep scores: %d/%d days checked, %d updated",
+                        i + 1, settings.days_back, updated)
 
-        new_score = new_props["Score"]["number"]
-        if new_score and new_score > 0:
-            notion.pages.update(
-                page_id=page["id"],
-                properties={"Score": {"number": new_score}},
-            )
-            repaired += 1
-
-    logger.info(
-        "Sleep sync complete: %d created, %d already existed, %d scores repaired",
-        created, len(existing_map), repaired,
-    )
+    logger.info("Sleep sync complete: %d created, %d Garmin scores updated, "
+                "%d unchanged, %d skipped", created, updated, unchanged, skipped)
