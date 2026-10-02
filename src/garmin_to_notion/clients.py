@@ -94,7 +94,7 @@ def _load_profile(garmin: GarminClient) -> None:
     garmin.display_name = profile["displayName"]
     garmin.full_name = profile.get("fullName") or garmin.display_name
     logger.info("Checking Garmin user settings...")
-    user_settings = garmin.garth.connectapi("/userprofile-service/usersettings")
+    user_settings = garmin.garth.connectapi("/userprofile-service/userprofile/user-settings")
     user_data = user_settings.get("userData", {}) if isinstance(user_settings, dict) else {}
     garmin.unit_system = user_data.get("measurementSystem") if isinstance(user_data, dict) else None
 
