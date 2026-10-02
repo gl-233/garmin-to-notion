@@ -1,4 +1,4 @@
-"""Garmin and Notion client initialization."""
+"""Initialize Garmin and Notion, preserving the most recent valid session."""
 
 from __future__ import annotations
 
@@ -6,17 +6,14 @@ import base64
 import json
 import logging
 import os
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from garminconnect import Garmin as GarminClient
 from notion_client import Client as NotionClient
-
 from garmin_to_notion.config import Settings
 
 logger = logging.getLogger(__name__)
-
 TOKENSTORE_DIR = Path(os.getenv("GARMIN_TOKENSTORE", "~/.garmin_tokens")).expanduser()
 
 
@@ -26,150 +23,125 @@ class Clients:
     notion: NotionClient
 
 
+def _validate_bundle(data: object) -> dict:
+    if not isinstance(data, dict):
+        raise ValueError("Invalid session bundle")
+    if not all(isinstance(data.get(k), dict) for k in ("oauth1", "oauth2")):
+        raise ValueError("Incomplete session bundle")
+    for key in ("oauth_token", "oauth_token_secret"):
+        if not data["oauth1"].get(key):
+            raise ValueError("Incomplete OAuth1 session")
+    if not data["oauth2"].get("access_token"):
+        raise ValueError("Incomplete OAuth2 session")
+    return data
+
+
 def _load_tokens_from_env() -> dict | None:
-    """Load OAuth tokens from GARMIN_TOKENS env var (base64 JSON bundle)."""
     raw = os.getenv("GARMIN_TOKENS", "").strip()
     if not raw:
         return None
     try:
-        data = json.loads(base64.b64decode(raw))
-        if "oauth1" in data and "oauth2" in data:
-            return data
-    except Exception as e:
-        logger.warning("Failed to decode GARMIN_TOKENS: %s", e)
-    return None
+        return _validate_bundle(json.loads(base64.b64decode(raw)))
+    except Exception:
+        # Do not print secret contents or decoder exceptions.
+        raise ValueError("GARMIN_TOKENS is invalid; replace the GitHub secret") from None
 
 
 def _load_tokens_from_disk() -> dict | None:
-    """Load OAuth tokens from disk (saved by browser_login.py or previous runs)."""
-    oauth1_path = TOKENSTORE_DIR / "oauth1_token.json"
-    oauth2_path = TOKENSTORE_DIR / "oauth2_token.json"
-    if not oauth1_path.exists() or not oauth2_path.exists():
+    try:
+        return _validate_bundle({
+            "oauth1": json.loads((TOKENSTORE_DIR / "oauth1_token.json").read_text()),
+            "oauth2": json.loads((TOKENSTORE_DIR / "oauth2_token.json").read_text()),
+        })
+    except FileNotFoundError:
         return None
-    try:
-        oauth1 = json.loads(oauth1_path.read_text())
-        oauth2 = json.loads(oauth2_path.read_text())
-        return {"oauth1": oauth1, "oauth2": oauth2}
-    except Exception as e:
-        logger.warning("Failed to load tokens from disk: %s", e)
-    return None
+    except Exception:
+        logger.warning("Saved Garmin session is unreadable; using the configured secret")
+        return None
 
 
-def _save_tokens_to_disk(tokens: dict) -> None:
-    """Save OAuth tokens to disk for reuse across runs."""
+def _expiry(tokens: dict) -> float:
     try:
-        TOKENSTORE_DIR.mkdir(parents=True, exist_ok=True)
-        (TOKENSTORE_DIR / "oauth1_token.json").write_text(json.dumps(tokens["oauth1"], indent=2))
-        (TOKENSTORE_DIR / "oauth2_token.json").write_text(json.dumps(tokens["oauth2"], indent=2))
-        logger.info("Tokens saved to %s", TOKENSTORE_DIR)
-    except Exception as e:
-        logger.warning("Failed to save tokens: %s", e)
+        return float(tokens["oauth2"].get("expires_at", 0))
+    except (ValueError, TypeError):
+        return 0
+
+
+def _select_tokens(secret: dict | None, cached: dict | None) -> tuple[dict | None, str]:
+    if secret is None:
+        return cached, "cache" if cached else "credentials"
+    if cached is None:
+        return secret, "GitHub secret"
+    # A new browser login must take precedence over a cache from an old login.
+    same_session = all(
+        secret["oauth1"].get(key) == cached["oauth1"].get(key)
+        for key in ("oauth_token", "oauth_token_secret")
+    ) and (secret["oauth1"].get("domain") or "garmin.com") == (
+        cached["oauth1"].get("domain") or "garmin.com"
+    )
+    if same_session and _expiry(cached) >= _expiry(secret):
+        return cached, "cache"
+    return secret, "GitHub secret"
+
+
+def _load_profile(garmin: GarminClient) -> None:
+    # Authentication is only successful after an actual authenticated request.
+    profile = garmin.garth.connectapi("/userprofile-service/socialProfile")
+    if not isinstance(profile, dict) or not profile.get("displayName"):
+        raise RuntimeError("Garmin did not return a valid user profile")
+    garmin.display_name = profile["displayName"]
+    garmin.full_name = profile.get("fullName") or garmin.display_name
+    user_settings = garmin.garth.connectapi("/userprofile-service/usersettings")
+    user_data = user_settings.get("userData", {}) if isinstance(user_settings, dict) else {}
+    garmin.unit_system = user_data.get("measurementSystem") if isinstance(user_data, dict) else None
 
 
 def _init_garmin_with_tokens(tokens: dict) -> GarminClient:
-    """Initialize GarminClient using pre-obtained OAuth tokens (no SSO login)."""
     import garth
 
-    # Use __init__ so all class-level URL attributes are set
     garmin = GarminClient()
-    garmin.garth = garth.Client(domain=tokens["oauth1"].get("domain", "garmin.com"))
-
-    # Load OAuth1 token
-    oauth1 = tokens["oauth1"]
-    garmin.garth.oauth1_token = garth.sso.OAuth1Token(
-        oauth_token=oauth1["oauth_token"],
-        oauth_token_secret=oauth1["oauth_token_secret"],
-        mfa_token=oauth1.get("mfa_token"),
-        mfa_expiration_timestamp=oauth1.get("mfa_expiration_timestamp"),
-        domain=oauth1.get("domain", "garmin.com"),
-    )
-
-    # Load OAuth2 token
-    oauth2 = tokens["oauth2"]
-    garmin.garth.oauth2_token = garth.sso.OAuth2Token(
-        **{k: v for k, v in oauth2.items() if k in garth.sso.OAuth2Token.__dataclass_fields__}
-    )
-
-    # Load profile (socialProfile works with OAuth2 bearer tokens)
-    try:
-        profile = garmin.garth.connectapi("/userprofile-service/socialProfile")
-        if profile and isinstance(profile, dict):
-            garmin.display_name = profile.get("displayName")
-            garmin.full_name = profile.get("fullName", profile.get("displayName"))
-    except Exception:
-        garmin.display_name = None
-        garmin.full_name = None
-
-    # Load settings
-    try:
-        settings = garmin.garth.connectapi("/userprofile-service/usersettings")
-        if settings and isinstance(settings, dict) and "userData" in settings:
-            garmin.unit_system = settings["userData"].get("measurementSystem")
-        else:
-            garmin.unit_system = None
-    except Exception:
-        garmin.unit_system = None
-
+    garmin.garth = garth.Client(domain=tokens["oauth1"].get("domain") or "garmin.com")
+    garmin.garth.oauth1_token = garth.sso.OAuth1Token(**{
+        k: v for k, v in tokens["oauth1"].items()
+        if k in garth.sso.OAuth1Token.__dataclass_fields__
+    })
+    garmin.garth.oauth2_token = garth.sso.OAuth2Token(**{
+        k: v for k, v in tokens["oauth2"].items()
+        if k in garth.sso.OAuth2Token.__dataclass_fields__
+    })
+    _load_profile(garmin)
     return garmin
 
 
+def save_garmin_tokens(garmin: GarminClient) -> None:
+    """Save the live tokens, including renewals made during authenticated requests."""
+    TOKENSTORE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    garmin.garth.dump(str(TOKENSTORE_DIR))
+    for name in ("oauth1_token.json", "oauth2_token.json"):
+        (TOKENSTORE_DIR / name).chmod(0o600)
+    logger.info("Current Garmin session saved for the next run")
+
+
 def init_clients(settings: Settings) -> Clients:
-    """Initialize and authenticate both Garmin and Notion clients.
-
-    Auth priority:
-    1. GARMIN_TOKENS env var (base64 JSON bundle from browser_login.py)
-    2. Cached tokens on disk (~/.garmin_tokens)
-    3. Fresh credential login with retry + backoff (last resort)
-    """
-    logger.info("Authenticating with Garmin Connect...")
-
-    # 1. Try GARMIN_TOKENS env var
-    tokens = _load_tokens_from_env()
-    if tokens:
-        try:
+    logger.info("Checking Garmin connection...")
+    try:
+        tokens, source = _select_tokens(_load_tokens_from_env(), _load_tokens_from_disk())
+        if tokens is not None:
             garmin = _init_garmin_with_tokens(tokens)
-            logger.info("Garmin auth successful (GARMIN_TOKENS secret, user: %s)", garmin.display_name)
-            _save_tokens_to_disk(tokens)
-            return Clients(garmin=garmin, notion=NotionClient(auth=settings.notion_token))
-        except Exception as e:
-            logger.warning("GARMIN_TOKENS failed: %s", e)
-
-    # 2. Try cached tokens on disk
-    tokens = _load_tokens_from_disk()
-    if tokens:
-        try:
-            garmin = _init_garmin_with_tokens(tokens)
-            logger.info("Garmin auth successful (cached tokens, user: %s)", garmin.display_name)
-            _save_tokens_to_disk(tokens)
-            return Clients(garmin=garmin, notion=NotionClient(auth=settings.notion_token))
-        except Exception as e:
-            logger.warning("Cached tokens failed: %s", e)
-
-    # 3. Fresh login with retry (last resort)
-    max_retries = 3
-    for attempt in range(1, max_retries + 1):
-        try:
+        else:
             garmin = GarminClient(settings.garmin_email, settings.garmin_password)
             garmin.login()
-            logger.info("Garmin auth successful (fresh login)")
-            # Save garth tokens for next time
-            try:
-                TOKENSTORE_DIR.mkdir(parents=True, exist_ok=True)
-                garmin.garth.dump(str(TOKENSTORE_DIR))
-            except Exception:
-                pass
-            return Clients(garmin=garmin, notion=NotionClient(auth=settings.notion_token))
-        except Exception as e:
-            if attempt < max_retries and "429" in str(e):
-                wait = 30 * attempt
-                logger.warning("Rate limited (attempt %d/%d), waiting %ds...", attempt, max_retries, wait)
-                time.sleep(wait)
-            else:
-                logger.error("Failed to authenticate (attempt %d/%d): %s", attempt, max_retries, e)
-                if attempt == max_retries:
-                    raise SystemExit(1) from e
+            _load_profile(garmin)
+        save_garmin_tokens(garmin)
+    except Exception as exc:
+        if "429" in str(exc) or "TooManyRequests" in type(exc).__name__:
+            logger.error("Garmin refused the connection (429). Stopping without further attempts.")
+        else:
+            logger.error("Garmin connection could not be verified (%s). No sync started.", type(exc).__name__)
+        raise SystemExit(1) from None
+    logger.info("Garmin connection verified (session source: %s)", source)
+    return Clients(garmin=garmin, notion=NotionClient(auth=settings.notion_token))
 
 
 def init_notion_only(settings: Settings) -> NotionClient:
-    """Initialize only the Notion client (for tools that don't need Garmin)."""
     return NotionClient(auth=settings.notion_token)
